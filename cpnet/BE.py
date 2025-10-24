@@ -85,88 +85,100 @@ class BE(CPAlgorithm):
         Q, qs = _score_(A.indptr, A.indices, A.data, c, x, num_nodes)
         return qs
 
-
-@numba.jit(nopython=True, cache=True)
+@numba.njit(cache=True)
 def _kernighan_lin_(A_indptr, A_indices, A_data, num_nodes):
+    """
+    Robust greedy ascent for the BE (binary) objective:
+      - At each step, try flipping each node's label (0↔1),
+      - pick the flip that yields the highest Q,
+      - apply it if it improves Q by > tol,
+      - stop when no single flip improves Q.
 
-    M = np.sum(A_data) / 2
-    p = M / np.maximum(1, (num_nodes * (num_nodes - 1) / 2))
-    x = np.zeros(num_nodes)
-    Nperi = num_nodes
+    Assumes:
+      - simple, undirected, binary CSR (upper/lower both present; we divide by 2 where needed)
+      - x in {0,1} (1=core, 0=periphery)
+    """
+
+    def compute_M(num_nodes, A_indptr):
+        degsum = 0.0
+        for i in range(num_nodes):
+            degsum += (A_indptr[i+1] - A_indptr[i])
+        return 0.5 * degsum  # undirected: each edge counted twice
+
+    def compute_Q_for_x(x, num_nodes, A_indptr, A_indices, M, T, pa):
+        # compute m_core_or (numer) and nc from scratch
+        numer2 = 0.0  # counted twice (i->j and j->i)
+        nc = 0.0
+        for i in range(num_nodes):
+            xi = x[i]
+            nc += xi
+            start, end = A_indptr[i], A_indptr[i+1]
+            for t in range(start, end):
+                j = A_indices[t]
+                xj = x[j]
+                numer2 += (xi + xj - xi * xj)
+        numer = 0.5 * numer2  # undirected
+
+        # M_b = number of node-pairs with ≥1 core endpoint
+        # closed form: M_b = (nc*(nc-1) + 2*nc*(N-nc)) / 2
+        N = float(num_nodes)
+        Mb = (nc * (nc - 1.0) + 2.0 * nc * (N - nc)) * 0.5
+
+        # pb = Mb / T, with clipping
+        pb = Mb / T
+        eps = 1e-12
+        if pb < eps:
+            pb = eps
+        elif pb > 1.0 - eps:
+            pb = 1.0 - eps
+
+        denom = (np.sqrt(pa * (1.0 - pa)) * np.sqrt(pb * (1.0 - pb)))
+        return (numer - pa * Mb) / denom
+
+    # --- precompute graph constants ---
+    T = 0.5 * num_nodes * (num_nodes - 1.0)
+    if T <= 0.0:
+        # empty or single-node graph
+        return np.zeros(num_nodes, dtype=np.float64)
+
+    M = compute_M(num_nodes, A_indptr)
+    pa = M / T
+    eps = 1e-12
+    if pa < eps:
+        pa = eps
+    elif pa > 1.0 - eps:
+        pa = 1.0 - eps
+
+    x = np.zeros(num_nodes, dtype=np.float64)
     for i in range(num_nodes):
-        if np.random.rand() < 0.5:
-            x[i] = 1
-            Nperi -= 1
+        x[i] = 1.0 if np.random.rand() < 0.5 else 0.0
 
-    xt = x.copy()
-    xbest = x.copy()
-    fixed = np.zeros(num_nodes)
-    Dperi = np.zeros(num_nodes)
+    Q_curr = compute_Q_for_x(x, num_nodes, A_indptr, A_indices, M, T, pa)
 
-    for _j in range(num_nodes):
+    tol = 1e-12
+    max_outer = 5 * num_nodes  # safety cap
 
-        fixed *= 0
-        Nperi = 0
-        numer = 0
-        for i in range(num_nodes):
-            Nperi += 1 - x[i]
-            Dperi[i] = 0
-            neighbors = A_indices[A_indptr[i] : A_indptr[i + 1]]
-            for _k, neighbor in enumerate(neighbors):
-                Dperi[i] += 1 - x[neighbor]
-                numer += x[i] + x[neighbor] - x[i] * x[neighbor]
-        numer = numer / 2.0 - p * (
-            (num_nodes * (num_nodes - 1.0)) / 2.0 - Nperi * (Nperi - 1.0) / 2.0
-        )
-        pb = 1 - Nperi * (Nperi - 1) / np.maximum(1, (num_nodes * (num_nodes - 1)))
-        if np.abs(pb - 1) < 1e-8 or np.abs(pb) < 1e-8:
-            Qold = 0
-        else:
-            Qold = numer / np.maximum(1e-20, np.sqrt(pb * (1 - pb)))
+    for _ in range(max_outer):
+        best_Q = Q_curr
+        best_k = -1
 
-        dQ = 0
-        dQmax = -np.inf
-        nid = 0
-        for i in range(num_nodes):
-            qmax = -np.inf
+        # try flipping each node and evaluate exact Q
+        for k in range(num_nodes):
+            x[k] = 1.0 - x[k]  # flip
+            Q_try = compute_Q_for_x(x, num_nodes, A_indptr, A_indices, M, T, pa)
+            if Q_try > best_Q + tol:
+                best_Q = Q_try
+                best_k = k
+            x[k] = 1.0 - x[k]  # revert
 
-            # select a node of which we update the label
-            numertmp = numer
-            for k in range(num_nodes):
-                if fixed[k] == 1:
-                    continue
-                dnumer = (Dperi[k] - p * (Nperi - (1 - xt[k]))) * (2 * (1 - xt[k]) - 1)
-                newNperi = Nperi + 2 * xt[k] - 1
-                pb = 1.0 - (newNperi * (newNperi - 1.0)) / np.maximum(
-                    1, (num_nodes * (num_nodes - 1.0))
-                )
-                if np.abs(pb - 1) < 1e-8 or np.abs(pb) < 1e-8:
-                    q = 0
-                else:
-                    q = (numer + dnumer) / np.maximum(1e-20, np.sqrt(pb * (1 - pb)))
-                if (qmax < q) and (pb * (1 - pb) > 0):
-                    nid = k
-                    qmax = q
-                    numertmp = numer + dnumer
-            numer = numertmp
-            Nperi += 2 * xt[nid] - 1
-            neighbors = A_indices[A_indptr[i] : A_indptr[i + 1]]
-            for _k, neik in enumerate(neighbors):
-                Dperi[neik] += 2 * xt[nid] - 1
-            xt[nid] = 1 - xt[nid]
-            dQ = dQ + qmax - Qold
-            Qold = qmax
-
-            # Save the core-periphery pair if it attains the largest quality
-            if dQmax < dQ:
-                xbest = xt.copy()
-                dQmax = dQ
-            fixed[nid] = 1
-        if dQmax <= 1e-7:
+        if best_k == -1:
             break
-        xt = xbest.copy()
-        x = xbest.copy()
-    return xbest
+
+        x[best_k] = 1.0 - x[best_k]
+        Q_curr = best_Q
+
+    return x
+
 
 
 @numba.jit(nopython=True, cache=True)
@@ -179,9 +191,8 @@ def _score_(A_indptr, A_indices, A_data, _c, _x, num_nodes):
     mcc = 0
     for i in range(num_nodes):
         nc += _x[i]
-
         neighbors = A_indices[A_indptr[i] : A_indptr[i + 1]]
-        for _k, j in enumerate(neighbors):
+        for  j in neighbors:
             mcc += _x[i] + _x[j] - _x[i] * _x[j]
             M += 1
 
@@ -194,6 +205,6 @@ def _score_(A_indptr, A_indices, A_data, _c, _x, num_nodes):
     Q = (mcc - pa * M_b) / np.maximum(
         1e-20, (np.sqrt(pa * (1 - pa)) * np.sqrt(pb * (1 - pb)))
     )
-    Q = Q / np.maximum(1, (num_nodes * (num_nodes - 1) / 2))
+    #Q = Q / np.maximum(1, (num_nodes * (num_nodes - 1) / 2))
 
     return Q, [Q]
